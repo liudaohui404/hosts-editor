@@ -4,7 +4,8 @@
 // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
+use std::process::Command;
 use serde::{Serialize, Deserialize};
 
 
@@ -16,6 +17,10 @@ enum Error {
     Io(#[from] std::io::Error),
     #[error("Group not found")]
     GroupNotFound,
+    #[error("Permission denied: Administrator privileges required")]
+    PermissionDenied,
+    #[error("Authentication failed")]
+    AuthenticationFailed,
 }
 
 // we must manually implement serde::Serialize
@@ -40,9 +45,130 @@ struct HostsEntry {
 const GROUP_MARKER_PREFIX: &str = "#------- ";
 const GROUP_MARKER_SUFFIX: &str = " -------";
 
-// 获取默认hosts文件路径（Windows平台）
+// 获取默认hosts文件路径（跨平台）
 fn get_hosts_path() -> &'static str {
-    r"C:\Windows\System32\drivers\etc\hosts"
+    #[cfg(target_os = "windows")]
+    {
+        r"C:\Windows\System32\drivers\etc\hosts"
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        "/etc/hosts"
+    }
+}
+
+// 检查是否有权限读写hosts文件
+#[tauri::command]
+fn check_hosts_permission() -> Result<bool, Error> {
+    let hosts_path = get_hosts_path();
+    
+    // 尝试读取文件
+    match fs::read_to_string(hosts_path) {
+        Ok(_) => {
+            // 尝试以追加模式打开文件来检查写权限
+            match fs::OpenOptions::new().append(true).open(hosts_path) {
+                Ok(_) => Ok(true),
+                Err(_) => Ok(false),
+            }
+        },
+        Err(_) => Ok(false),
+    }
+}
+
+// 使用管理员权限写入hosts文件 (macOS/Linux)
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_hosts_with_sudo(content: &str) -> Result<(), Error> {
+    // 创建临时文件
+    let temp_path = "/tmp/hosts_temp";
+    fs::write(temp_path, content)?;
+    
+    #[cfg(target_os = "macos")]
+    {
+        // 在 macOS 上使用 osascript 来触发图形化的权限提升对话框
+        let script = format!(
+            r#"do shell script "cp {} {}" with administrator privileges"#,
+            temp_path,
+            get_hosts_path()
+        );
+        
+        let output = Command::new("osascript")
+            .args(&["-e", &script])
+            .output();
+        
+        // 删除临时文件
+        let _ = fs::remove_file(temp_path);
+        
+        match output {
+            Ok(result) => {
+                if result.status.success() {
+                    Ok(())
+                } else {
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    if stderr.contains("User canceled") || stderr.contains("cancelled") {
+                        Err(Error::AuthenticationFailed)
+                    } else {
+                        Err(Error::PermissionDenied)
+                    }
+                }
+            },
+            Err(_) => Err(Error::PermissionDenied),
+        }
+    }
+    
+    #[cfg(all(target_os = "linux", not(target_os = "macos")))]
+    {
+        // Linux 上仍然使用 sudo 命令
+        let output = Command::new("sudo")
+            .args(&["cp", temp_path, get_hosts_path()])
+            .output();
+        
+        // 删除临时文件
+        let _ = fs::remove_file(temp_path);
+        
+        match output {
+            Ok(result) => {
+                if result.status.success() {
+                    Ok(())
+                } else {
+                    Err(Error::AuthenticationFailed)
+                }
+            },
+            Err(_) => Err(Error::PermissionDenied),
+        }
+    }
+}
+
+// Windows版本的权限写入（如果需要的话）
+#[cfg(target_os = "windows")]
+fn write_hosts_with_elevation(content: &str) -> Result<(), Error> {
+    // Windows上直接尝试写入，如果失败则返回权限错误
+    match fs::write(get_hosts_path(), content) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(Error::PermissionDenied),
+    }
+}
+
+// 安全的hosts文件写入函数
+fn safe_write_hosts(content: &str) -> Result<(), Error> {
+    // 首先尝试直接写入
+    match fs::write(get_hosts_path(), content) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                // 权限不足，尝试提权写入
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
+                    write_hosts_with_sudo(content)
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    write_hosts_with_elevation(content)
+                }
+            } else {
+                Err(Error::Io(e))
+            }
+        }
+    }
 }
 
 // 获取所有分组的名称
@@ -112,30 +238,27 @@ fn add_hosts_fragment_with_group(group_name: &str, fragment: &str) -> Result<(),
     // 首先尝试删除已存在的分组（如果存在的话）
     let _ = remove_hosts_group(group_name); // 忽略错误，因为分组可能不存在
     
-    let mut content = String::new();
+    // 读取当前hosts文件内容
+    let current_content = fs::read_to_string(get_hosts_path())?;
+    let mut new_content = current_content;
     
     // 添加开始标记
-    content.push_str(&format!("{}{}{}\n", GROUP_MARKER_PREFIX, group_name, GROUP_MARKER_SUFFIX));
+    new_content.push_str(&format!("{}{}{}\n", GROUP_MARKER_PREFIX, group_name, GROUP_MARKER_SUFFIX));
     
     // 添加片段内容（过滤掉空行）
     for line in fragment.lines() {
         let line = line.trim();
         if !line.is_empty() {
-            content.push_str(line);
-            content.push('\n');
+            new_content.push_str(line);
+            new_content.push('\n');
         }
     }
     
     // 添加结束标记
-    content.push_str(&format!("{}{} end{}\n", GROUP_MARKER_PREFIX, group_name, GROUP_MARKER_SUFFIX));
+    new_content.push_str(&format!("{}{} end{}\n", GROUP_MARKER_PREFIX, group_name, GROUP_MARKER_SUFFIX));
     
-    // 将内容追加到文件
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(get_hosts_path())?;
-    file.write_all(content.as_bytes())?;
-    
-    Ok(())
+    // 使用安全写入方法
+    safe_write_hosts(&new_content)
 }
 
 // 删除指定分组的所有条目
@@ -170,14 +293,8 @@ fn remove_hosts_group(group_name: &str) -> Result<(), Error> {
     }
     
     if group_found {
-        // 写入修改后的内容
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(get_hosts_path())?;
-        file.write_all(new_content.as_bytes())?;
-        
-        Ok(())
+        // 使用安全写入方法
+        safe_write_hosts(&new_content)
     } else {
         Err(Error::GroupNotFound)
     }
@@ -216,16 +333,8 @@ fn add_to_hosts_scope(new_content: &str) -> Result<(), Error> {
         lines.push("# END OF HOSTS SWITCHER".to_string());
     }
     
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(get_hosts_path())?;
-
-    for line in lines {
-        writeln!(file, "{}", line)?;
-    }
-
-    Ok(())
+    let final_content = lines.join("\n");
+    safe_write_hosts(&final_content)
 }
 
 fn main() {
@@ -236,7 +345,8 @@ fn main() {
             get_all_hosts_groups,
             get_hosts_group_entries,
             add_hosts_fragment_with_group,
-            remove_hosts_group
+            remove_hosts_group,
+            check_hosts_permission
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

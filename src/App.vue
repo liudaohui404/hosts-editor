@@ -6,6 +6,17 @@
         <div class="header flex items-center text-gray-500">
           <img src="/node_servers.png" alt="Hosts Manager" class="h-11 w-11" />
           <span class="ml-2 font-semibold text-lg"> A Hosts Switch Tool</span>
+          <!-- 权限状态指示器 -->
+          <div class="ml-auto flex items-center">
+            <div 
+              :class="hasHostsPermission ? 'text-green-600' : 'text-orange-600'"
+              class="flex items-center text-xs"
+              :title="hasHostsPermission ? '具有管理员权限' : '需要管理员权限才能修改 hosts 文件'"
+            >
+              <span class="mr-1">●</span>
+              <span>{{ hasHostsPermission ? '权限正常' : '需要权限' }}</span>
+            </div>
+          </div>
         </div>
         <div class="border-t border-gray-200 mt-6"></div>
         
@@ -209,6 +220,29 @@ const internalInstance = getCurrentInstance();
 const systemHosts = ref<string>("");
 const editingGroupIndex = ref(-1); // 正在编辑名称的分组索引
 const editingGroupName = ref(""); // 编辑中的分组名称
+const hasHostsPermission = ref<boolean>(false); // 权限状态
+
+// 检查 hosts 文件权限
+const checkPermission = async () => {
+  try {
+    hasHostsPermission.value = await invoke("check_hosts_permission");
+    return hasHostsPermission.value;
+  } catch (error) {
+    console.error("检查权限失败:", error);
+    hasHostsPermission.value = false;
+    return false;
+  }
+};
+
+// 权限提示
+const showPermissionWarning = () => {
+  const isMac = navigator.platform.toUpperCase().indexOf('MAC') !== -1;
+  if (isMac) {
+    showMessage("修改 hosts 文件需要管理员权限，系统将弹出密码输入对话框", "warning");
+  } else {
+    showMessage("修改 hosts 文件需要管理员权限，请以管理员身份运行此应用", "warning");
+  }
+};
 
 // 安全的消息显示函数
 const showMessage = (message: string, type: 'success' | 'error' | 'warning' | 'info' = 'info') => {
@@ -430,6 +464,11 @@ const deleteItem = async (index: number) => {
   
   if (!response) return;
   
+  // 如果分组已激活，检查权限
+  if (group.active && !hasHostsPermission.value) {
+    showPermissionWarning();
+  }
+  
   try {
     if (group.active) {
       // 情况1：分组已激活 - 需要从 hosts 文件中删除分组内容
@@ -470,10 +509,10 @@ const deleteItem = async (index: number) => {
     console.error("删除分组失败:", error);
     const errorMessage = error?.toString() || "删除分组失败";
     
-    if (errorMessage.includes("Insufficient privileges") || errorMessage.includes("Administrator access required")) {
-      showMessage("需要管理员权限才能修改 hosts 文件。请以管理员身份重新启动应用程序。", "error");
-    } else if (errorMessage.includes("User cancelled elevation")) {
-      showMessage("用户取消了权限提升请求", "info");
+    if (errorMessage.includes("Permission denied") || errorMessage.includes("权限")) {
+      showMessage("权限不足，请确保您有管理员权限", "error");
+    } else if (errorMessage.includes("Authentication failed")) {
+      showMessage("用户取消了密码输入或认证失败", "info");
     } else if (errorMessage.includes("Group not found")) {
       // 如果分组在 hosts 文件中未找到，但本地有记录，仍然删除本地记录
       showMessage(`分组 "${group.label}" 在 hosts 文件中未找到，已从本地删除`, "warning");
@@ -493,6 +532,11 @@ const deleteItem = async (index: number) => {
 
 // 切换分组激活状态
 const toggleGroupActive = async (group: Group, forceDeactivate = false) => {
+  // 检查权限，如果没有权限则先提示
+  if (!hasHostsPermission.value) {
+    showPermissionWarning();
+  }
+  
   try {
     const shouldActivate = forceDeactivate ? false : !group.active;
     if (shouldActivate) {
@@ -526,10 +570,10 @@ const toggleGroupActive = async (group: Group, forceDeactivate = false) => {
     console.error("切换分组状态失败:", error);
     const errorMessage = error?.toString() || "操作失败";
     
-    if (errorMessage.includes("Insufficient privileges") || errorMessage.includes("Administrator access required")) {
-      showMessage("需要管理员权限才能修改 hosts 文件。请以管理员身份重新启动应用程序。", "error");
-    } else if (errorMessage.includes("User cancelled elevation")) {
-      showMessage("用户取消了权限提升请求", "info");
+    if (errorMessage.includes("Permission denied") || errorMessage.includes("权限")) {
+      showMessage("权限不足，请确保您有管理员权限", "error");
+    } else if (errorMessage.includes("Authentication failed")) {
+      showMessage("用户取消了密码输入或认证失败", "info");
     } else {
       showMessage("操作失败：" + errorMessage, "error");
     }
@@ -548,6 +592,12 @@ const createNewGroup = async () => {
     showMessage("分组名称已存在", "warning");
     return;
   }
+  
+  // 检查权限，如果没有权限则先提示
+  if (!hasHostsPermission.value) {
+    showPermissionWarning();
+  }
+  
   try {
     // 创建空分组
     await invoke("add_hosts_fragment_with_group", { 
@@ -568,10 +618,10 @@ const createNewGroup = async () => {
     console.error("创建分组失败:", error);
     const errorMessage = error?.toString() || "创建分组失败";
     
-    if (errorMessage.includes("Insufficient privileges") || errorMessage.includes("Administrator access required")) {
-      showMessage("需要管理员权限才能修改 hosts 文件。请以管理员身份重新启动应用程序。", "error");
-    } else if (errorMessage.includes("User cancelled elevation")) {
-      showMessage("用户取消了权限提升请求", "info");
+    if (errorMessage.includes("Permission denied") || errorMessage.includes("权限")) {
+      showMessage("权限不足，请确保您有管理员权限", "error");
+    } else if (errorMessage.includes("Authentication failed")) {
+      showMessage("用户取消了密码输入或认证失败", "info");
     } else {
       showMessage("创建分组失败：" + errorMessage, "error");
     }
@@ -610,6 +660,12 @@ const saveCurrentGroup = async () => {
     showMessage("没有更改需要保存", "info");
     return;
   }
+  
+  // 检查权限，如果没有权限则先提示
+  if (!hasHostsPermission.value) {
+    showPermissionWarning();
+  }
+  
   try {
     // 如果分组当前是激活状态，先停用它
     const wasActive = group.active;
@@ -650,10 +706,10 @@ const saveCurrentGroup = async () => {
     console.error("保存失败:", error);
     const errorMessage = error?.toString() || "保存失败";
     
-    if (errorMessage.includes("Insufficient privileges") || errorMessage.includes("Administrator access required")) {
-      showMessage("需要管理员权限才能修改 hosts 文件。请以管理员身份重新启动应用程序。", "error");
-    } else if (errorMessage.includes("User cancelled elevation")) {
-      showMessage("用户取消了权限提升请求", "info");
+    if (errorMessage.includes("Permission denied") || errorMessage.includes("权限")) {
+      showMessage("权限不足，请确保您有管理员权限", "error");
+    } else if (errorMessage.includes("Authentication failed")) {
+      showMessage("用户取消了密码输入或认证失败", "info");
     } else {
       showMessage("保存失败：" + errorMessage, "error");
     }
@@ -732,6 +788,11 @@ const finishEditGroupName = async () => {
     return;
   }
   
+  // 如果分组是激活状态，检查权限
+  if (oldGroup.active && !hasHostsPermission.value) {
+    showPermissionWarning();
+  }
+  
   try {
     const wasActive = oldGroup.active;
     
@@ -779,8 +840,11 @@ const finishEditGroupName = async () => {
     oldGroup.label = editingGroupName.value; // 恢复原始名称
     console.error("重命名分组失败:", error);
     const errorMessage = error?.toString() || "重命名失败";
-    if (errorMessage.includes("Access is denied") || errorMessage.includes("权限")) {
-      showMessage("权限不足，请以管理员身份运行", "error");
+    
+    if (errorMessage.includes("Permission denied") || errorMessage.includes("权限")) {
+      showMessage("权限不足，请确保您有管理员权限", "error");
+    } else if (errorMessage.includes("Authentication failed")) {
+      showMessage("用户取消了密码输入或认证失败", "info");
     } else {
       showMessage(`重命名失败: ${errorMessage}`, "error");
     }
@@ -798,6 +862,9 @@ const cancelEditGroupName = () => {
 // 初始化
 onMounted(async () => {
   try {
+    // 检查权限状态
+    await checkPermission();
+    
     // 获取系统 hosts
     const sysHosts = await invoke("get_default_hosts") as string;
     systemHosts.value = sysHosts;
